@@ -6,24 +6,26 @@ from datetime import datetime, timedelta
 import numpy as np
 import paho.mqtt.client as mqtt
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 # Simulation parameters from environment
 DATA_SEND_INTERVAL = 3  # seconds between payloads (simulated)
-NOMINAL_CYCLE_MIN = 8   # average processing time (minutes) - reduced for more activity
+NOMINAL_CYCLE_MIN = 6   # average processing time (minutes) - faster for demo
 SIGMA_CYCLE_MIN = 1.0   # standard deviation (minutes)
 
-# Transfer times between stations (minutes)
+# Transfer times between stations (minutes) - faster for demo
 DIST_MIN = {
-    ("Saw1", "Milling1"): 1,
-    ("Saw1", "Lathe1"): 2,
-    ("Saw1", "Milling2"): 2,
-    ("Milling1", "Lathe1"): 1,
-    ("Milling2", "Lathe1"): 1,
+    ("Saw1", "Milling1"): 0.5,
+    ("Saw1", "Lathe1"): 0.5,
+    ("Saw1", "Milling2"): 0.5,
+    ("Milling1", "Lathe1"): 0.3,
+    ("Milling2", "Lathe1"): 0.3,
 }
-DEFAULT_MOVE_MIN = 1
+DEFAULT_MOVE_MIN = 0.5
 
 # Factory clock
 simulation_current_time = datetime.now()
+time_lock = threading.Lock()
 
 def get_transport_time(from_station: str, to_station: str) -> float:
     """Returns transport time (minutes) with ±20% jitter."""
@@ -31,21 +33,21 @@ def get_transport_time(from_station: str, to_station: str) -> float:
         (from_station, to_station),
         DIST_MIN.get((to_station, from_station), DEFAULT_MOVE_MIN)
     )
-    jitter = random.uniform(-0.2, 0.2) * base
-    return max(0.5, base + jitter)
+    jitter = random.uniform(-0.1, 0.1) * base
+    return max(0.2, base + jitter)
 
 def get_cycle_time_minutes() -> float:
     """Returns a normally distributed cycle time (min), truncated at ≥1 min."""
-    return max(1.0, np.random.normal(NOMINAL_CYCLE_MIN, SIGMA_CYCLE_MIN))
+    return max(2.0, np.random.normal(NOMINAL_CYCLE_MIN, SIGMA_CYCLE_MIN))
 
 class MQTTClient:
-    """Improved MQTT client with better connection handling"""
+    """Thread-safe MQTT client"""
     def __init__(self, broker_address, broker_port):
-        # Use the new API version
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.broker_address = broker_address
         self.broker_port = broker_port
         self.connected = False
+        self.publish_lock = threading.Lock()
         
         # Set callbacks
         self.client.on_connect = self._on_connect
@@ -59,14 +61,14 @@ class MQTTClient:
             
             # Wait for connection
             retry_count = 0
-            while not self.connected and retry_count < 10:
+            while not self.connected and retry_count < 15:
                 time.sleep(1)
                 retry_count += 1
             
             if self.connected:
                 print(f"✅ Connected to MQTT broker")
             else:
-                raise ConnectionError("Failed to connect after 10 retries")
+                raise ConnectionError("Failed to connect after 15 retries")
                 
         except Exception as e:
             print(f"❌ Failed to connect to MQTT broker: {e}")
@@ -85,17 +87,18 @@ class MQTTClient:
             print("⚠️  Unexpected MQTT disconnection")
 
     def publish(self, topic, payload):
-        if self.connected:
-            try:
-                result = self.client.publish(topic, json.dumps(payload))
-                if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                    print(f"⚠️  Failed to publish to {topic}")
-                else:
-                    print(f"📤 Published to {topic}: {payload.get('entity', 'unknown')}")
-            except Exception as e:
-                print(f"❌ Error publishing to {topic}: {e}")
-        else:
-            print("⚠️  Cannot publish: MQTT not connected")
+        with self.publish_lock:
+            if self.connected:
+                try:
+                    result = self.client.publish(topic, json.dumps(payload))
+                    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                        print(f"⚠️  Failed to publish to {topic}")
+                    else:
+                        print(f"📤 [{payload.get('entity', 'unknown')}] Published to {topic}")
+                except Exception as e:
+                    print(f"❌ Error publishing to {topic}: {e}")
+            else:
+                print("⚠️  Cannot publish: MQTT not connected")
     
     def disconnect(self):
         """Clean disconnection"""
@@ -113,7 +116,7 @@ class Piece:
         self.tools = tools
 
 class Machine:
-    """Simulates a machine that processes pieces, publishes data over MQTT."""
+    """Thread-safe machine simulation."""
     def __init__(self, name: str, mtype: str, mqtt_client: MQTTClient, time_multiplier: int = 1) -> None:
         self.name = name
         self.type = mtype
@@ -167,7 +170,7 @@ class Machine:
         return round(base + random.uniform(-spread, spread), 2)
 
     def simulate_variable_data(self, dt: float) -> dict[str, float]:
-        """Simulates realistic sensor data and updates thermal & vibration model."""
+        """Simulates realistic sensor data."""
         if self._baseline is None:
             self._baseline = self._generate_baseline()
         b = self._baseline
@@ -188,9 +191,16 @@ class Machine:
         else:
             return {}
 
-        # First-order thermal model
-        dT = (power * self.heat_coeff - (self.current_temp - self.ambient_temp) / self.thermal_time_const) * dt
-        self.current_temp += dT + random.uniform(-0.2, 0.2)
+        # Enhanced thermal model for more realistic temperatures
+        heat_input = power * self.heat_coeff
+        if self.busy:
+            heat_input *= 2.0  # More heat when processing
+        
+        dT = (heat_input - (self.current_temp - self.ambient_temp) / self.thermal_time_const) * dt
+        self.current_temp += dT + random.uniform(-0.3, 0.3)
+        
+        # Keep temperature in realistic range
+        self.current_temp = max(18.0, min(85.0, self.current_temp))
 
         # Vibration including wear
         base_vib = round(0.1 * power + random.uniform(0, 0.1), 2)
@@ -207,107 +217,186 @@ class Machine:
         return data
 
     def is_available(self) -> bool:
-        """Indicates if machine is free to process new work."""
-        return not self.busy
+        """Thread-safe availability check."""
+        with self.lock:
+            return not self.busy
+
+    def set_busy(self, busy: bool):
+        """Thread-safe busy state setter."""
+        with self.lock:
+            self.busy = busy
 
     def _publish_event(self, topic: str, payload: dict) -> None:
         """Helper to publish MQTT messages."""
         self.mqtt.publish(topic, payload)
 
-    def _run_simulation(self, duration_s: float) -> None:
+    def _run_simulation(self, duration_s: float, piece_id: str) -> None:
         """Runs sensor data simulation over the specified duration."""
-        global simulation_current_time
         steps = int(duration_s / DATA_SEND_INTERVAL)
-        print(f"  📊 Running {steps} sensor readings for {self.name}...")
+        print(f"  📊 [{self.name}] Running {steps} sensor readings for piece {piece_id}...")
         
         for step in range(steps):
             try:
                 data = self.simulate_variable_data(DATA_SEND_INTERVAL)
-                payload = {"entity": self.name, "data": data, "timestamp": simulation_current_time.isoformat()}
+                with time_lock:
+                    current_time = datetime.now()
+                
+                payload = {"entity": self.name, "data": data, "timestamp": current_time.isoformat()}
                 self._publish_event(f"/plant/data/{self.name}", payload)
 
-                simulation_current_time += timedelta(seconds=DATA_SEND_INTERVAL)
                 time.sleep(DATA_SEND_INTERVAL / self.time_multiplier)
             except Exception as e:
-                print(f"❌ Error in simulation step: {e}")
+                print(f"❌ [{self.name}] Error in simulation step: {e}")
                 break
 
-    def setup_tool(self, tool: str, start_time: datetime) -> None:
+    def setup_tool(self, tool: str) -> None:
         """Performs tool setup, including wear incrementation."""
-        global simulation_current_time
-        setup_min = random.uniform(2, 4)  # Reduced setup time
+        setup_min = random.uniform(1, 2)  # Faster setup for demo
         duration_s = setup_min * 60
 
         self.state = "setup"
-        print(f"  🔧 {self.name}: Setting up tool {tool}...")
+        print(f"  🔧 [{self.name}] Setting up tool {tool}...")
+        
+        with time_lock:
+            current_time = datetime.now()
         
         self._publish_event(f"/plant/tracking/{self.name}", {
             "entity": self.name,
             "event": "setup_start",
             "data": {"tool": tool},
-            "timestamp": start_time.isoformat(),
+            "timestamp": current_time.isoformat(),
         })
 
-        simulation_current_time += timedelta(minutes=setup_min)
         time.sleep(duration_s / self.time_multiplier)
 
         # Update tool and wear
         self.current_tool = tool
-        self.tool_wear[tool] = min(1.0, self.tool_wear.get(tool, 0.0) + 0.05)
+        self.tool_wear[tool] = min(1.0, self.tool_wear.get(tool, 0.0) + 0.03)
+
+        with time_lock:
+            current_time = datetime.now()
 
         self._publish_event(f"/plant/tracking/{self.name}", {
             "entity": self.name,
             "event": "setup_end",
             "data": {"tool": tool},
-            "timestamp": simulation_current_time.isoformat(),
+            "timestamp": current_time.isoformat(),
         })
         self.state = "idle"
 
-    def process(self, piece_id: str, duration_s: float, start_time: datetime, tools_map: dict) -> None:
+    def process(self, piece_id: str, duration_s: float, tools_map: dict) -> None:
         """Processes a piece in time slices per required tools."""
         tool_list = tools_map.get(self.type, [None])
-        adjusted = duration_s * random.uniform(0.8, 1.2)  # More variation
+        adjusted = duration_s * random.uniform(0.7, 1.3)  # More variation
         slice_s = adjusted / len(tool_list)
 
-        print(f"  ⚙️  {self.name}: Processing {piece_id} with tools {tool_list}")
+        print(f"  ⚙️ [{self.name}] Processing {piece_id} with tools {tool_list}")
 
         for tool in tool_list:
             if self.type in ("Milling", "Lathe") and tool != self.current_tool:
-                self.setup_tool(tool, start_time)
-                start_time = simulation_current_time
+                self.setup_tool(tool)
 
             self.state = "processing"
-            self.busy = True
+            self.set_busy(True)
+            
+            with time_lock:
+                current_time = datetime.now()
+            
             self._publish_event(f"/plant/tracking/{self.name}", {
                 "entity": self.name,
                 "event": "processing_start",
                 "data": {"piece_id": piece_id, "tool": tool},
-                "timestamp": start_time.isoformat(),
+                "timestamp": current_time.isoformat(),
             })
 
-            self._run_simulation(slice_s)
+            self._run_simulation(slice_s, piece_id)
 
-            end_time = simulation_current_time
+            with time_lock:
+                current_time = datetime.now()
+            
             self._publish_event(f"/plant/tracking/{self.name}", {
                 "entity": self.name,
                 "event": "processing_end",
                 "data": {"piece_id": piece_id, "tool": tool},
-                "timestamp": end_time.isoformat(),
+                "timestamp": current_time.isoformat(),
             })
 
             self.state = "idle"
-            self.busy = False
-            start_time = end_time
+            self.set_busy(False)
 
-def publish_tracking_event(mqtt_client: MQTTClient, entity: str, event: str, data: dict, timestamp: str) -> None:
+def publish_tracking_event(mqtt_client: MQTTClient, entity: str, event: str, data: dict) -> None:
     """Publishes a generic tracking event."""
+    with time_lock:
+        current_time = datetime.now()
+    
     mqtt_client.publish(f"/plant/tracking/{entity}", {
         "entity": entity, 
         "event": event, 
         "data": data, 
-        "timestamp": timestamp
+        "timestamp": current_time.isoformat()
     })
-    
+
+def process_piece_thread(piece, machines, mqtt_client, stats):
+    """Process a single piece in its own thread."""
+    try:
+        piece_obj = Piece(piece["piece_id"], piece["route"], piece["material"], piece["tools"])
+        prev = "Warehouse"
+        
+        print(f"\n🔄 [Thread-{piece['piece_id']}] Processing {piece_obj.piece_id} ({piece['material']})")
+
+        for station in piece_obj.route[1:-1]:
+            machine = machines[station]
+            
+            # Wait for machine availability with timeout
+            wait_count = 0
+            max_wait = 30  # Reduced timeout for faster demo
+            while not machine.is_available() and wait_count < max_wait:
+                time.sleep(0.5)
+                wait_count += 1
+            
+            if wait_count >= max_wait:
+                print(f"⚠️ [{piece_obj.piece_id}] Timeout waiting for {station}, skipping...")
+                continue
+
+            if prev != station:
+                # Move piece
+                print(f"  🚛 [{piece_obj.piece_id}] Moving from {prev} to {station}")
+                publish_tracking_event(mqtt_client, "piece", "move_start",
+                    {"piece_id": piece_obj.piece_id, "from": prev, "to": station})
+                
+                move_min = get_transport_time(prev, station)
+                time.sleep(move_min * 60 / 8.0)  # Fast movement for demo
+                
+                publish_tracking_event(mqtt_client, "piece", "move_end",
+                    {"piece_id": piece_obj.piece_id, "from": prev, "to": station})
+
+            # Process on machine
+            cycle_min = get_cycle_time_minutes()
+            machine.process(piece_obj.piece_id, cycle_min * 60, piece_obj.tools)
+            prev = station
+
+        # Return to warehouse
+        print(f"  🏠 [{piece_obj.piece_id}] Returning to warehouse")
+        publish_tracking_event(mqtt_client, "piece", "move_start",
+            {"piece_id": piece_obj.piece_id, "from": prev, "to": "Warehouse"})
+        
+        move_min = get_transport_time(prev, "Warehouse")
+        time.sleep(move_min * 60 / 8.0)
+        
+        publish_tracking_event(mqtt_client, "piece", "move_end",
+            {"piece_id": piece_obj.piece_id, "from": prev, "to": "Warehouse"})
+        
+        publish_tracking_event(mqtt_client, "Warehouse_01", "deposit",
+            {"piece_id": piece_obj.piece_id})
+        
+        with threading.Lock():
+            stats['pieces_processed'] += 1
+        
+        print(f"✅ [{piece_obj.piece_id}] Completed processing")
+
+    except Exception as e:
+        print(f"❌ [Thread-{piece['piece_id']}] Error: {e}")
+
 if __name__ == "__main__":
     import signal
     import sys
@@ -315,8 +404,8 @@ if __name__ == "__main__":
     # Configuration from environment variables
     BROKER_ADDRESS = os.getenv('MQTT_BROKER', 'localhost')
     BROKER_PORT = int(os.getenv('MQTT_PORT', '1883'))
-    TIME_MULTIPLIER = float(os.getenv('TIME_MULTIPLIER', '8.0'))  # Faster simulation
-    PIECE_COUNT = int(os.getenv('PIECE_COUNT', '10'))  # More pieces
+    TIME_MULTIPLIER = float(os.getenv('TIME_MULTIPLIER', '8.0'))
+    PIECE_COUNT = int(os.getenv('PIECE_COUNT', '20'))  # More pieces for demo
 
     # Statistics
     stats = {'pieces_processed': 0, 'messages_sent': 0, 'start_time': datetime.now()}
@@ -327,9 +416,8 @@ if __name__ == "__main__":
         print(f"\n🛑 Simulation interrupted by user")
         print(f"📊 Final Stats:")
         print(f"   Pieces processed: {stats['pieces_processed']}")
-        print(f"   Messages sent: {stats['messages_sent']}")
         runtime = datetime.now() - stats['start_time']
-        print(f"   Runtime: {runtime}")
+        print(f"   Total runtime: {runtime}")
         
         if mqtt_client:
             mqtt_client.disconnect()
@@ -338,10 +426,11 @@ if __name__ == "__main__":
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
     
-    print("🏭 Starting Enhanced IoT Industrial Simulator...")
+    print("🏭 Starting PARALLEL IoT Industrial Simulator for DEMO...")
     print(f"⚡ Time multiplier: {TIME_MULTIPLIER}x")
     print(f"📦 Pieces to process: {PIECE_COUNT}")
     print(f"📡 MQTT Broker: {BROKER_ADDRESS}:{BROKER_PORT}")
+    print(f"🔀 PARALLEL PROCESSING: Multiple machines will be active simultaneously!")
     print("Press Ctrl+C to stop simulation\n")
 
     try:
@@ -356,13 +445,14 @@ if __name__ == "__main__":
             )
         }
 
-        # Enhanced plan with more variety
+        # Enhanced plan with guaranteed parallel processing
         plan_templates = [
             ("Milling1", "steel", "Milling", ["TM10", "TM25"]),
             ("Milling2", "aluminum", "Milling", ["TM12", "TM30"]),
             ("Lathe1", "steel", "Lathe", ["TL05"]),
             ("Lathe1", "brass", "Lathe", ["TL08"]),
             ("Milling1", "titanium", "Milling", ["TM15", "TM35"]),
+            ("Milling2", "copper", "Milling", ["TM20", "TM40"]),
         ]
         
         plan = []
@@ -376,92 +466,65 @@ if __name__ == "__main__":
                 "route": ["Warehouse", "Saw1", machine, "Warehouse"]
             })
 
-        print(f"📋 Processing {len(plan)} pieces...\n")
+        print(f"📋 Processing {len(plan)} pieces in PARALLEL...\n")
         
-        for job_idx, job in enumerate(plan, 1):
-            try:
-                piece = Piece(job["piece_id"], job["route"], job["material"], job["tools"])
-                prev = "Warehouse"
+        # Process pieces in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as executor:  # Allow up to 6 concurrent pieces
+            futures = []
+            
+            for i, piece in enumerate(plan):
+                # Stagger the start times to create overlap
+                if i > 0:
+                    time.sleep(3)  # 3 second stagger between piece starts
                 
-                print(f"🔄 Processing piece {job_idx}/{len(plan)}: {piece.piece_id} ({job['material']})")
+                future = executor.submit(process_piece_thread, piece, machines, mqtt_client, stats)
+                futures.append(future)
+                print(f"🚀 Started processing thread for {piece['piece_id']}")
+            
+            print(f"\n🔀 All {len(plan)} pieces started in parallel!")
+            print("🎯 Dashboard should now show multiple active machines!")
+            
+            # Wait for all pieces to complete
+            for future in futures:
+                try:
+                    future.result(timeout=300)  # 5 minute timeout per piece
+                except Exception as e:
+                    print(f"❌ Piece processing error: {e}")
 
-                for station in piece.route[1:-1]:
-                    machine = machines[station]
-                    
-                    # Wait for machine availability
-                    wait_count = 0
-                    while not machine.is_available():
-                        time.sleep(1 / TIME_MULTIPLIER)
-                        wait_count += 1
-                        if wait_count > 60:  # Safety timeout
-                            print(f"⚠️  Timeout waiting for {station}")
-                            break
-
-                    if prev != station:
-                        # Move piece
-                        print(f"  🚛 Moving {piece.piece_id} from {prev} to {station}")
-                        publish_tracking_event(mqtt_client, "piece", "move_start",
-                            {"piece_id": piece.piece_id, "from": prev, "to": station},
-                            simulation_current_time.isoformat())
-                        stats['messages_sent'] += 1
-                        
-                        move_min = get_transport_time(prev, station)
-                        simulation_current_time += timedelta(minutes=move_min)
-                        time.sleep(move_min * 60 / TIME_MULTIPLIER)
-                        
-                        publish_tracking_event(mqtt_client, "piece", "move_end",
-                            {"piece_id": piece.piece_id, "from": prev, "to": station},
-                            simulation_current_time.isoformat())
-                        stats['messages_sent'] += 1
-
-                    # Process on machine
-                    cycle_min = get_cycle_time_minutes()
-                    machine.process(piece.piece_id, cycle_min * 60, simulation_current_time, piece.tools)
-                    prev = station
-                    simulation_current_time += timedelta(minutes=cycle_min)
-                    
-                    # Estimate messages sent during processing
-                    processing_steps = int(cycle_min * 60 / DATA_SEND_INTERVAL)
-                    stats['messages_sent'] += processing_steps + 2  # +2 for start/end events
-
-                # Return to warehouse
-                print(f"  🏠 Returning {piece.piece_id} to warehouse")
-                publish_tracking_event(mqtt_client, "piece", "move_start",
-                    {"piece_id": piece.piece_id, "from": prev, "to": "Warehouse"},
-                    simulation_current_time.isoformat())
-                
-                move_min = get_transport_time(prev, "Warehouse")
-                simulation_current_time += timedelta(minutes=move_min)
-                time.sleep(move_min * 60 / TIME_MULTIPLIER)
-                
-                publish_tracking_event(mqtt_client, "piece", "move_end",
-                    {"piece_id": piece.piece_id, "from": prev, "to": "Warehouse"},
-                    simulation_current_time.isoformat())
-                
-                publish_tracking_event(mqtt_client, "Warehouse_01", "deposit",
-                    {"piece_id": piece.piece_id}, simulation_current_time.isoformat())
-                
-                stats['messages_sent'] += 3
-                stats['pieces_processed'] += 1
-                
-                print(f"✅ Completed piece {piece.piece_id}\n")
-
-            except Exception as e:
-                print(f"❌ Error processing piece {job_idx}: {e}")
-                continue
-
-        print(f"🎉 Simulation completed successfully!")
+        print(f"\n🎉 Parallel simulation completed!")
         print(f"📊 Final Statistics:")
         print(f"   Pieces processed: {stats['pieces_processed']}")
-        print(f"   Messages sent: {stats['messages_sent']}")
         runtime = datetime.now() - stats['start_time']
         print(f"   Total runtime: {runtime}")
         
-        # Keep running for continuous simulation
-        print("\n🔄 Starting continuous operation...")
+        # Continue with continuous operation
+        print("\n🔄 Starting continuous parallel operation for demo...")
+        continuous_count = 0
         while True:
-            time.sleep(10)
-            print(f"📊 {datetime.now().strftime('%H:%M:%S')} - Simulation still running...")
+            continuous_count += 1
+            print(f"\n🔄 Continuous cycle {continuous_count} - Starting 4 pieces simultaneously...")
+            
+            # Start 4 pieces simultaneously (one for each machine type)
+            simultaneous_pieces = [
+                {"piece_id": f"DEMO{continuous_count:02d}-A", "material": "steel", "tools": {"Milling": ["TM10"]}, "route": ["Warehouse", "Saw1", "Milling1", "Warehouse"]},
+                {"piece_id": f"DEMO{continuous_count:02d}-B", "material": "aluminum", "tools": {"Milling": ["TM12"]}, "route": ["Warehouse", "Saw1", "Milling2", "Warehouse"]},
+                {"piece_id": f"DEMO{continuous_count:02d}-C", "material": "brass", "tools": {"Lathe": ["TL05"]}, "route": ["Warehouse", "Saw1", "Lathe1", "Warehouse"]},
+                {"piece_id": f"DEMO{continuous_count:02d}-D", "material": "titanium", "tools": {"Milling": ["TM15"]}, "route": ["Warehouse", "Saw1", "Milling1", "Warehouse"]},
+            ]
+            
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(process_piece_thread, piece, machines, mqtt_client, stats) 
+                        for piece in simultaneous_pieces]
+                
+                # Wait for this batch to complete
+                for future in futures:
+                    try:
+                        future.result(timeout=180)
+                    except Exception as e:
+                        print(f"❌ Continuous cycle error: {e}")
+            
+            print(f"✅ Continuous cycle {continuous_count} completed")
+            time.sleep(5)  # Brief pause between cycles
         
     except Exception as e:
         print(f"❌ Simulation error: {e}")
