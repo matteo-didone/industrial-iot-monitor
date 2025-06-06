@@ -59,7 +59,7 @@ Edge Device   Mosquitto    Python Service  Time-Series  FastAPI
 1. **Clona il repository**
    ```bash
    git clone https://github.com/matteo-didone/industrial-iot-monitor
-   cd iot-industrial-monitor
+   cd industrial-iot-monitor
    ```
 
 2. **Configura variabili d'ambiente**
